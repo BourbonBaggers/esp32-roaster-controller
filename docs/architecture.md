@@ -246,6 +246,109 @@ Enable WAL mode on init: `PRAGMA journal_mode=WAL` to prevent read/write content
 
 ---
 
+## Safety Architecture
+
+All safety logic in this section runs entirely on the ESP32 — no network, server, or MQTT dependency.
+
+### Valve and Motor Model
+
+The stepper motor controls a propane valve through a tight coupler. Key physical facts:
+- Small turns produce large flame changes — the valve is highly sensitive
+- No closed-position sensor exists; position is tracked only via step counting
+- When the stepper driver is **enabled** (ENABLE_PIN LOW), coils are energized and the shaft is locked (holding torque). When **disabled** (ENABLE_PIN HIGH), the shaft spins freely for manual adjustment.
+- The valve does not drift when the motor is disabled — it holds position passively.
+- The propane tank valve remains manually open during operation; the stepper valve is the primary flame control.
+
+### Home Position (Step Zero)
+
+`netSteps = 0` is defined as **minimum stable flame** — the smallest flame the burner reliably holds without going out. A physical mark (paint dot or tape) on the coupler indicates this position. All step counting is relative to this reference.
+
+- **PID operating range:** 0 to `+MAX_OPEN_STEPS` (estimated ~200 based on observed operation; confirmed during commissioning)
+- **Emergency close range:** 0 to `-MAX_CLOSE_STEPS` (calibrated during commissioning — see below)
+- PID output is hard-clamped to [0, MAX_OPEN_STEPS] before any step pulse is issued. The motor physically cannot exceed these limits regardless of PID output.
+
+### Step Limit Calibration (Commissioning Checklist Item)
+
+`MAX_CLOSE_STEPS` must be measured once during initial setup:
+1. Lock motor at home (netSteps = 0)
+2. Drive CCW slowly, counting steps, until flame extinguishes
+3. Record that count, subtract 15% as safety margin → that's `MAX_CLOSE_STEPS`
+4. Store in firmware constants
+
+### Startup / Ignition Procedure
+
+The motor is **disabled on every boot**. This replaces the previous practice of physically unplugging the motor to free the valve for ignition.
+
+```
+Boot → ENABLE_PIN HIGH (motor disabled, shaft free)
+     → OLED: "IGNITION MODE"
+     → Dashboard: "Ignition Mode — valve free to turn"
+
+User manually opens valve → ignites burner → dials back to reference mark
+
+User presses "Lock & Begin Session" on dashboard
+     → ENABLE_PIN LOW (motor locks at current position)
+     → netSteps = 0
+     → PID starts
+```
+
+### Restart Mid-Roast
+
+If the device restarts during an active session:
+- Motor starts disabled (valve holds position — no drift)
+- `netSteps` is read from LittleFS (written on every step change)
+- OLED and dashboard show: "Restart detected — last position: +X steps"
+- User chooses:
+  - **Resume** → motor locks at stored position, PID continues
+  - **Re-home** → user manually returns valve to reference mark, motor locks at netSteps = 0
+
+### Normal Session End
+
+On "End Roast" from dashboard:
+1. PID suspended
+2. Drive to netSteps = 0 (minimum stable flame) at normal speed
+3. Disable motor (ENABLE_PIN HIGH) — valve free for manual close
+4. Dashboard prompts: "Motor released. Close valve manually."
+
+### Temperature Thresholds
+
+| Level | Threshold | Action |
+|---|---|---|
+| Warning | ~550°F | Queue `Roast Notification` alert (alert_type: `temp_alert`), PID continues |
+| Hard cutoff | ~675°F | Emergency close sequence (see below) |
+
+Thresholds are defined as firmware constants and can be adjusted without changing logic.
+
+### Emergency Close Sequence
+
+Triggered automatically at hard cutoff temperature. No network required.
+
+```
+1. Drive CCW at maximum safe speed until netSteps = -MAX_CLOSE_STEPS
+   (past home, as far toward closed as calibrated limit allows)
+2. ENABLE_PIN HIGH — motor releases, valve free for manual intervention
+3. PID suspended, session flagged EMERGENCY
+4. Queue alert to LittleFS: alert_type "emergency_close", timestamp, last temp
+5. OLED: "EMERGENCY — CLOSE TANK VALVE"
+6. Dashboard: red emergency state on reconnect
+7. Recovery requires explicit manual reset — system does NOT auto-resume
+```
+
+The $12 stepper motor is considered acceptable collateral damage in an emergency. Burning down the building is not.
+
+### Rate-of-Rise Alarm
+
+In addition to absolute temperature thresholds, a simplified ROR check runs on the device (independent of the server's 60-second rolling ROR):
+- Compares current temp to the reading from 30 seconds ago
+- If delta > 50°F in 30 seconds while already above 500°F → queues warning alert
+- Does not trigger emergency close on its own — that's the threshold's job
+
+### Alert Queue (Network-Resilient)
+
+All alerts are written to a LittleFS circular buffer (max 20 events) before attempting MQTT publish. On MQTT reconnect, the queue is replayed in order. The server deduplicates by `timestamp + alert_type`. A 10-minute internet outage followed by a reconnect at 620°F sends the alert immediately on reconnect.
+
+---
+
 ## Firmware Changes (`firmware/src/RoasterPIDv2.ino`)
 
 **Remove:** `handleRoot` and all 640-line embedded HTML, `handleMoveStepper`, `handleStatus`, all `server.on(...)` handlers, `WebServer`, `HTTPClient`, `sendIftttAlert`, `serialBuffer`, `escapeJson`, `WebServer.h`.
@@ -258,7 +361,10 @@ Enable WAL mode on init: `PRAGMA journal_mode=WAL` to prevent read/write content
 - `resolveBroker()` — called once after WiFi connects; uses `MDNS.queryHost("roaster-hub.local")` to get broker IP; falls back to configurable fallback IP if mDNS fails
 - `publishTelemetry()` — builds JSON with `JsonDocument`, publishes every 2s
 - `mqttCallback()` — dispatches on `cmd` field, applies `setTemp` as absolute assignment
-- OLED shows MQTT connection status ("MQTT: OK" / "MQTT: --") alongside temp
+- `safetyLoop()` — runs every 2s alongside PID; checks temperature thresholds, enforces step limits, triggers emergency close, manages alert queue
+- `emergencyClose()` — drives to -MAX_CLOSE_STEPS at max speed, disables motor, writes LittleFS alert
+- `loadStepState()` / `saveStepState()` — reads/writes netSteps to LittleFS on every change
+- OLED shows MQTT connection status ("MQTT: OK" / "MQTT: --"), ignition mode state, and emergency state
 
 **`platformio.ini` lib_deps to add:**
 ```
