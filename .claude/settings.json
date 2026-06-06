@@ -17,8 +17,26 @@
       "Bash(echo *)",
       "Bash(python3 *)",
       "Bash(pip *)",
+      "Bash(pip3 *)",
       "Bash(docker *)",
-      "Bash(jq *)"
+      "Bash(jq *)",
+      "Bash(curl *)",
+      "Bash(chmod *)",
+      "Bash(which *)",
+      "Bash(brew *)",
+      "Bash(mosquitto_pub *)",
+      "Bash(mosquitto_sub *)",
+      "Bash(open *)",
+      "Bash(tee *)",
+      "Bash(tail *)",
+      "Bash(head *)",
+      "Bash(wc *)",
+      "Bash(sed *)",
+      "Bash(awk *)",
+      "Bash(sort *)",
+      "Bash(uniq *)",
+      "Bash(xargs *)",
+      "Bash(tr *)"
     ]
   }
 }
