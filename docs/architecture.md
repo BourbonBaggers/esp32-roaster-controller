@@ -253,9 +253,10 @@ roast_profiles (
 
 roast_sessions (
   id INTEGER PRIMARY KEY, profile_id INTEGER REFERENCES roast_profiles(id),
-  lot_id TEXT NOT NULL,       -- auto-assigned sequential (e.g. "LOT-0042"), user may override with custom label
+  lot_id TEXT NOT NULL,       -- format: TO-BULK-20260606-A; user may override
   started_at TEXT NOT NULL, ended_at TEXT,
   batch_volume_gal REAL,      -- standard batch = 5 gallons; recorded for reference
+  tea_bags_count INTEGER,     -- output yield for this batch; highly variable
   ambient_temp_f REAL,        -- fetched from Open-Meteo at session start
   wind_speed_mph REAL,        -- fetched from Open-Meteo at session start
   weather_fetched_at TEXT,    -- ISO timestamp of weather fetch
@@ -290,6 +291,18 @@ color_reference_photos (
   notes TEXT, created_at TEXT
 )
 ```
+
+**Telemetry growth and retention:**
+
+- 1 reading every 2s → 30 rows/min → ~2,700 rows per 90-min roast
+- ~150–200 bytes per row (data + indexes + SQLite page overhead)
+- **~500KB per roast** — 1,000 roasts ≈ 500MB, 10,000 roasts ≈ 5GB
+- At normal production volume, 10GB would take many years to reach
+
+Pruning policy (configurable via `TELEMETRY_RETAIN_DAYS` env var, default 365):
+- Session summary rows (`roast_sessions`) and events (`roast_events`) are kept forever
+- `roast_telemetry` rows older than `TELEMETRY_RETAIN_DAYS` are deleted on a nightly vacuum
+- Historical charts for pruned sessions fall back to the session summary (peak temp, duration, lot ID) rather than showing nothing
 
 **Lot ID format:** `{product_code}-{sku}-{YYYYMMDD}-{batch_letter}`
 
@@ -508,9 +521,26 @@ Also add: `build_flags = -DMQTT_MAX_PACKET_SIZE=512`
 
 ## Docker Services
 
+### Environment Configuration
+
+Sensitive and host-specific values live in `docker/.env` (gitignored). A `docker/.env.example` with placeholder values is committed as documentation.
+
+```bash
+# docker/.env  (gitignored — never commit)
+APP_PORT=            # dashboard port
+MQTT_BROKER=         # broker hostname (roaster-hub.local or IP)
+DB_PATH=/data/roaster.db
+KLAVIYO_API_KEY=
+KLAVIYO_PROFILE_EMAIL=
+WEATHER_ZIP=75248
+OPEN_METEO_LAT=      # resolved from zip at first run, cached
+OPEN_METEO_LON=
+TELEMETRY_RETAIN_DAYS=365
+```
+
 ### `docker-compose.yml`
 - `mosquitto`: ports 1883 (MQTT) + 9001 (WebSocket, for future debug). `allow_anonymous true` for LAN-only.
-- `app`: FastAPI + uvicorn, port configured via `APP_PORT` env var. Volumes: `./app:/app` (live reload during dev) + named `roaster-db:/data` for SQLite persistence. Env vars: `MQTT_BROKER`, `DB_PATH`, `KLAVIYO_API_KEY`, `KLAVIYO_PROFILE_EMAIL`, `WEATHER_ZIP`, `OPEN_METEO_LAT`, `OPEN_METEO_LON`, `APP_PORT`.
+- `app`: FastAPI + uvicorn, port from `APP_PORT`. Volumes: `./app:/app` (live reload during dev) + named `roaster-db:/data` for SQLite persistence. Reads all config from `docker/.env` via `env_file`.
 
 ### Key Python Library Choices
 - `paho-mqtt==2.0.0` — new callback API (5-arg `on_connect`), use `CallbackAPIVersion.VERSION2`
@@ -649,6 +679,16 @@ Background `asyncio` task, checks every 15 seconds. For the active session, comp
 ## Frontend Features (`static/index.html` + `static/app.js`)
 
 **Design:** Mobile-first. All controls and live data are designed for phone/tablet use. Historical analysis views (charts, overlays, color consistency table) may use wider layouts on desktop — this is the one area where desktop-first is acceptable.
+
+**Navigation:** Hamburger menu (☰) slide-out drawer — not tabs. Sections in the drawer:
+- **Dashboard** — live temp, controls, active session
+- **History** — past sessions, charts, overlays
+- **Color Library** — reference photos, batch photo uploads
+- **Profiles** — roast profile management
+- **Maintenance** — checklist, log maintenance
+- **Settings** — PID tuning (with tooltips), weather zip, alert thresholds, chart animation toggle
+
+Drawer pattern keeps the main view uncluttered on mobile and makes adding new sections trivial without hitting tab overflow.
 
 **Live Dashboard:**
 - Large current temp display + ROR (°F/min)
