@@ -320,14 +320,20 @@ Fetch the reading from 60 seconds ago for the active session, compute `delta_tem
 Use Klaviyo v3 Track API: `POST https://a.klaviyo.com/api/events/`  
 Headers: `Authorization: Klaviyo-API-Key {pk_...}`, `revision: 2024-02-15`
 
-**Events fired:**
-| Event Name | Trigger |
-|---|---|
-| `Roast Temp Alert` | Temp deviates > threshold from setpoint for > 30s |
-| `Roast Progress Update` | Every 5 minutes during active session (replaces IFTTT) |
-| `Profile Step Alert` | Profile-scheduled offset reached (cut flame, eject, lid on, etc.) |
+**One event, one flow.** All notifications use a single Klaviyo event name — `Roast Notification` — so only one flow and one trigger need to be configured in Klaviyo. The `alert_type` property drives conditional content blocks inside that flow to vary the subject line and body per notification type.
 
-Properties always include: `session_id`, `wood_type`, `current_temp`, `elapsed_min`, `message`.
+**Event name:** `Roast Notification`
+
+**`alert_type` values and when they fire:**
+| `alert_type` | When |
+|---|---|
+| `temp_alert` | Temp deviates > threshold from setpoint for > 30s |
+| `progress_update` | Every 5 minutes during active session (replaces IFTTT) |
+| `profile_step` | Profile-scheduled offset reached (cut flame, eject, lid on, etc.) |
+
+**Properties always included:** `session_id`, `wood_type`, `current_temp`, `elapsed_min`, `alert_type`, `message`, `subject`.
+
+`subject` is included in the event payload so Klaviyo's conditional blocks can set the email subject line without needing separate flows.
 
 ---
 
