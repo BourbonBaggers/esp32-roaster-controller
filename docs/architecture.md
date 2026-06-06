@@ -164,18 +164,36 @@ python simulator.py --scenario slow-heat        # cold/windy day — 30-min warm
 # Each 2s tick:
 # Real warmup: ~15-30 min from 72°F ambient to 450°F setpoint
 # heat_rate tuned so default sim hits 450°F in ~20 min at speed=1
-heat_rate = 0.35  # degrees per second at reference step position
-cool_rate = 0.08  # passive heat loss (ambient ~72°F)
+heat_rate = 0.35   # degrees per second at reference step position
+cool_rate = 0.08   # passive heat loss (ambient ~72°F)
 stepper_effect = net_steps * 0.06  # more CW steps = more heat input
 delta = (heat_rate + stepper_effect - cool_rate) * 2  # 2s tick
 # Thermal lag: asymptotic approach to target
 temp += delta * (1 - abs(current_temp - target_temp) / 600)
 
+# Noise model: real environment is NOT a lab. Normal: ±1-2°F every 2s.
+# Windy/cold conditions: ±5-10°F swings. Modulated by wind_speed parameter.
+noise = random.gauss(0, noise_sigma)   # noise_sigma driven by wind_speed
+temp += noise
+
+# Blowout detection threshold: 30°F drop in a short window = likely blowout
+# Simulator can inject a blowout by cutting heat_rate to 0 for one tick
+
 # Anomaly scenarios override normal physics:
-# runaway: stepper_effect ignored, heat_rate *= 3
-# stuck-valve: stepper_effect = 0 always
-# mqtt-drop: client.disconnect() at t=5min, reconnect at t=10min
-# slow-heat: heat_rate *= 0.5, cool_rate *= 2 (wind simulation)
+# runaway:    stepper_effect ignored, heat_rate *= 3
+# stuck-valve: stepper_effect = 0 always (valve not responding)
+# mqtt-drop:  client.disconnect() at t=5min, reconnect at t=10min
+# slow-heat:  heat_rate *= 0.5, wind_speed = 20 (cold/windy day)
+# blowout:    heat_rate = 0 for 30s, then normal (simulates flame out then relight)
+```
+
+**Weather simulation parameters** (all configurable as CLI flags or env vars):
+```bash
+python simulator.py \
+  --ambient-temp 65      # starting ambient temp (°F)
+  --wind-speed 8         # mph; drives noise_sigma (calm=1°F σ, 20mph=8°F σ)
+  --wind-variability 0.3 # how much wind gusts (0=steady, 1=very gusty)
+  --scenario blowout     # inject a blowout at t=15min
 ```
 
 **`docker-compose.yml` simulator service:**
@@ -273,7 +291,19 @@ color_reference_photos (
 )
 ```
 
-**Lot ID generation:** Sequential numeric ID auto-assigned on session start (e.g. `LOT-0042`). User may override with a custom text label at session start. Multiple batches in a day each get their own lot ID — date alone is not sufficient to distinguish them.
+**Lot ID format:** `{product_code}-{sku}-{YYYYMMDD}-{batch_letter}`
+
+| Product | Code |
+|---|---|
+| Toasted Oak | `TO` |
+| Charred Oak | `CO` |
+| Smoke Infusion | `SI` |
+| Toasted Cherry | `TC` |
+| Cherry Cinnamon | `CC` |
+
+SKU defaults to `BULK`. Batch letter increments A→B→C per day per product. Example: `TO-BULK-20260606-A`, `TO-BULK-20260606-B`.
+
+Auto-generated at session start; user may override the full string with a custom label.
 
 Enable WAL mode on init: `PRAGMA journal_mode=WAL` to prevent read/write contention at 2s insert rate.
 
@@ -302,11 +332,19 @@ The stepper motor controls a propane valve through a tight coupler. Key physical
 
 ### Step Limit Calibration (Commissioning Checklist Item)
 
-`MAX_CLOSE_STEPS` must be measured once during initial setup:
+Two limits must be calibrated once during initial setup and stored as firmware constants:
+
+**`MAX_CLOSE_STEPS`** — how far CCW past home is safe:
 1. Lock motor at home (netSteps = 0)
 2. Drive CCW slowly, counting steps, until flame extinguishes
-3. Record that count, subtract 15% as safety margin → that's `MAX_CLOSE_STEPS`
-4. Store in firmware constants
+3. Subtract 15% safety margin → `MAX_CLOSE_STEPS`
+
+**`MAX_OPEN_STEPS`** — how far CW from home is safe:
+1. Lock motor at home (netSteps = 0)
+2. Drive CW slowly, watching flame; stop when flame is clearly excessive (visually unsafe)
+3. Subtract 15% safety margin → `MAX_OPEN_STEPS`
+
+Estimated range from field observation: ~200 steps total. Both limits enforced in firmware before any step pulse is issued.
 
 ### LittleFS Persistent State
 
@@ -332,6 +370,8 @@ User presses "Lock & Begin Session" on dashboard (requires server connection)
      → PID starts
 ```
 
+**Rain warning:** At "Lock & Begin Session", the server checks the Open-Meteo hourly forecast. If precipitation probability exceeds 5% in any of the next 3 hours, a dismissible warning banner is shown before confirming session start. Roasting in rain is inadvisable; this is a reminder, not a block.
+
 **Future consideration:** A physical button on the device for "Lock & Begin Session" — eliminates the need to have the dashboard open for startup. Not in initial scope.
 
 ### Restart Mid-Roast
@@ -349,10 +389,13 @@ LittleFS stores both `netSteps` and `setTemp`, so both survive power loss.
 
 On "End Roast" from dashboard:
 1. PID suspended
-2. Drive to netSteps = 0 (minimum stable flame) at normal speed
-3. Disable motor (ENABLE_PIN HIGH) — valve free
-4. OLED: "BEGIN COOL DOWN"
-5. Dashboard enters cooldown tracking mode (user has already closed the tank valve)
+2. Drive to netSteps = 0 (minimum stable flame) at normal speed — buys time to close tank valve
+3. Motor stays **enabled** at step 0 (holds valve at minimum flame position)
+4. Dashboard enters "Post-Roast" state: shows timer counting up from "End Roast" clicked, current temp, and "Close tank valve when ready"
+5. Minimum flame will hold temperature around ~250°F — the roaster is still lit until tank valve is manually closed
+6. When user closes tank valve, temperature will begin dropping naturally
+7. OLED: "BEGIN COOL DOWN" + elapsed time since end
+8. System continues logging telemetry through cooldown
 
 ### Cooldown Tracking
 
@@ -398,6 +441,16 @@ A simplified ROR check runs on the device (independent of the server's 60-second
 - If delta > 50°F in 30 seconds while already above 500°F → queues `temp_alert`
 - Does not trigger emergency close on its own — that's the 600°F threshold's job
 
+### Blowout Detection
+
+Real-world conditions (wind, cold) cause significant temperature variability — normal noise is ±1–2°F per reading, with gusts causing ±5–10°F swings. A blowout (flame extinguished by wind) produces a sustained, rapid drop distinct from normal noise.
+
+- Server monitors rolling 30-second temperature delta during active sessions
+- If temp drops ≥ 30°F in any 30-second window while `netSteps > 0` and session is active → queue `Roast Notification` (alert_type: `blowout_suspected`)
+- PID continues running (it will attempt to open valve further, which is correct if the flame relights)
+- Alert message: "Possible blowout — temperature dropped 30°F+ rapidly. Check burner."
+- Not an emergency close — user investigates and decides. If temp continues dropping, the normal cooldown tracking handles it.
+
 ### Alert Queue (Network-Resilient)
 
 All alerts are written to a LittleFS circular buffer (max 20 events) before attempting MQTT publish. On MQTT reconnect, the queue is replayed in order. The server deduplicates by `timestamp + alert_type`. A 10-minute internet outage followed by a reconnect at 550°F sends the alert immediately on reconnect.
@@ -435,7 +488,7 @@ OLED state machine:
 |---|---|---|---|
 | Ignition mode | `IGNITION MODE` | `FREE VALVE` | — |
 | Running, MQTT OK | `427°F → 450°F` | `AUTO  OK` | `+18 steps` |
-| Running, MQTT down | `427°F → 450°F` | `AUTO  --` | `+18 steps` |
+| Running, MQTT down | `427°F → 450°F` | `AUTO  NET` | `+18 steps` |
 | Restart detected | `RESTART DET.` | `LOCK TO RESUME` | — |
 | Cool down | `BEGIN COOL DOWN` | `312°F` | — |
 | Safe to eject | `SAFE TO EJECT` | `188°F` | — |
@@ -455,21 +508,9 @@ Also add: `build_flags = -DMQTT_MAX_PACKET_SIZE=512`
 
 ## Docker Services
 
-### Production Server
-
-| Property | Value |
-|---|---|
-| Host | PRODUCTION_HOST |
-| SSH user | PRODUCTION_USER |
-| Auth | Certificate (no password) |
-| App port | **8060** |
-| MQTT port | 1883 (internal to Docker network) |
-
-Dashboard accessible at `http://PRODUCTION_HOST:8060` from any LAN device.
-
 ### `docker-compose.yml`
 - `mosquitto`: ports 1883 (MQTT) + 9001 (WebSocket, for future debug). `allow_anonymous true` for LAN-only.
-- `app`: FastAPI + uvicorn, **port 8060**. Volumes: `./app:/app` (live reload during dev) + named `roaster-db:/data` for SQLite persistence. Env vars: `MQTT_BROKER`, `DB_PATH`, `KLAVIYO_API_KEY`, `KLAVIYO_PROFILE_EMAIL`, `WEATHER_ZIP`, `OPEN_METEO_LAT`, `OPEN_METEO_LON`.
+- `app`: FastAPI + uvicorn, port configured via `APP_PORT` env var. Volumes: `./app:/app` (live reload during dev) + named `roaster-db:/data` for SQLite persistence. Env vars: `MQTT_BROKER`, `DB_PATH`, `KLAVIYO_API_KEY`, `KLAVIYO_PROFILE_EMAIL`, `WEATHER_ZIP`, `OPEN_METEO_LAT`, `OPEN_METEO_LON`, `APP_PORT`.
 
 ### Key Python Library Choices
 - `paho-mqtt==2.0.0` — new callback API (5-arg `on_connect`), use `CallbackAPIVersion.VERSION2`
@@ -565,10 +606,26 @@ Headers: `Authorization: Klaviyo-API-Key {pk_...}`, `revision: 2024-02-15`
 | `emergency_valve_failure` | Temp not dropping during emergency close | Every **30 seconds** until manual reset |
 | `profile_step` | Profile-scheduled offset reached (cut flame, eject, lid on, etc.) | On schedule |
 | `cooldown_ready` | Temp drops below 200°F post-session | Once |
+| `blowout_suspected` | Temp drops ≥30°F in 30s during active session | Once per event |
 
 **Properties always included:** `session_id`, `wood_type`, `current_temp`, `elapsed_min`, `alert_type`, `message`, `subject`.
 
 `subject` is included in the event payload so Klaviyo's conditional blocks can set the email subject line without needing separate flows. Email body content (including future HTML formatting) is controlled by Klaviyo template conditional blocks keyed on `alert_type`.
+
+---
+
+## Maintenance Tracking
+
+A running roast count is stored in the database. After every 5 completed sessions, a **toast banner** appears on the dashboard at next login prompting the user to perform machine maintenance before starting a new roast. The banner is dismissible (user can acknowledge and proceed).
+
+**Maintenance checklist (shown in the banner):**
+- Compressed air on all burners (clear debris and dust)
+- Machine greasing
+- Machine oiling
+- Chain oiling
+- General cleaning
+
+Maintenance acknowledgement is logged as a `roast_events` entry (event_type: `maintenance_logged`) so the interval resets. The 5-roast threshold is configurable.
 
 ---
 
@@ -585,7 +642,7 @@ Background `asyncio` task, checks every 15 seconds. For the active session, comp
 | Toasted Oak | 450°F | 45 min | 35m: "10 min until flame cut", 45m: "Cut flame", 75m: "Check cooling" |
 | Charred Oak | 450°F | 75 min | 65m: "10 min until flame cut", 75m: "Cut flame", 105m: "Check cooling" |
 | Smoke Infusion | 450°F | 75 min | 65m: "10 min until eject", 75m: "Eject", 80m: "Lid on", 135m: "Check smoldering", 195m: "Begin cool" |
-| Toasted Cherry | 450°F | 45 min | TBD — editable in UI |
+| Toasted Cherry | 450°F | 45 min | 35m: "10 min until flame cut", 45m: "Cut flame", 75m: "Check cooling" — identical to Toasted Oak; stored separately so procedures can diverge independently |
 
 ---
 
@@ -596,13 +653,13 @@ Background `asyncio` task, checks every 15 seconds. For the active session, comp
 **Live Dashboard:**
 - Large current temp display + ROR (°F/min)
 - Set temp with +5/-5 buttons
-- Manual/Auto toggle — switching to Manual **disables the motor** (ENABLE_PIN HIGH), freeing the valve for hand adjustment. Switching back to Auto re-enables the motor.
-- Real/Sim toggle
-- CW/CCW stepper buttons with step size slider (Manual mode only)
+- Manual/Auto toggle — switching to Manual **disables the motor** (ENABLE_PIN HIGH), freeing the valve for hand adjustment. CW/CCW buttons and step size slider are hidden in Manual mode (motor is decoupled — buttons have no effect). Switching back to Auto re-enables the motor.
+- Real/Sim toggle — **disabled during an active session with live telemetry**; can only switch to sim when no real device telemetry is being received
 - Elapsed time + net steps
-- Dual-axis Chart.js: temp (left) + ROR (right, dashed), `animation: false` for live updates
+- Dual-axis Chart.js: temp (left) + ROR (right, dashed); chart animation is a user-toggleable setting (default off for performance during live updates)
 - WebSocket with 3s auto-reconnect
-- Cooldown tracking view after session end (temp curve continues until <200°F)
+- Post-roast state: timer counting up since "End Roast", current temp, "Close tank valve when ready" prompt
+- Cooldown tracking view: temp curve continues until <200°F, then `cooldown_ready` alert fires
 
 **Session Management:**
 - "Lock & Begin Session" button (requires server connection) → modal:
