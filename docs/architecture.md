@@ -133,6 +133,12 @@ docker compose --profile sim up     # starts broker + app + simulator together
 # Or run standalone:
 cd docker/simulator
 python simulator.py --profile "Toasted Oak" --start-temp 72 --speed 10
+
+# Anomaly modes:
+python simulator.py --scenario runaway          # temp climbs past setpoint uncontrolled
+python simulator.py --scenario mqtt-drop        # MQTT disconnects mid-roast for 5 minutes
+python simulator.py --scenario stuck-valve      # valve stops responding (no temp change on steps)
+python simulator.py --scenario slow-heat        # cold/windy day — 30-min warmup curve
 ```
 
 `--speed 10` runs simulation at 10× real time so you can test a 45-minute roast in 4.5 minutes.
@@ -147,20 +153,29 @@ python simulator.py --profile "Toasted Oak" --start-temp 72 --speed 10
   - `setPid` → updates simulated PID parameters
   - `resetNetSteps`, `resetElapsed`, `setSimTemp` → updates internal state
 - Simulates a realistic temperature curve:
+  - **Warmup: 15–30 minutes from ambient to 450°F** (real-world calibrated range depending on wind/conditions)
   - Heats toward `setTemp` at a rate influenced by net stepper position
   - Adds small random noise (±1°F) to mimic real sensor readings
   - Simulates thermal inertia (doesn't snap to target instantly)
 - Prints a running log to stdout: `[12s] Temp: 243.2°F → 450.0°F, ROR: +14.2°F/min, Steps: +8`
 
-**Temperature physics model (simple but realistic):**
+**Temperature physics model (calibrated to real hardware):**
 ```python
 # Each 2s tick:
-heat_rate = 0.8  # baseline degrees per second when at full heat
-cool_rate = 0.3  # passive heat loss
-stepper_effect = net_steps * 0.15  # more CW steps = more heat input
+# Real warmup: ~15-30 min from 72°F ambient to 450°F setpoint
+# heat_rate tuned so default sim hits 450°F in ~20 min at speed=1
+heat_rate = 0.35  # degrees per second at reference step position
+cool_rate = 0.08  # passive heat loss (ambient ~72°F)
+stepper_effect = net_steps * 0.06  # more CW steps = more heat input
 delta = (heat_rate + stepper_effect - cool_rate) * 2  # 2s tick
-# Add thermal lag: temp moves toward target_temp asymptotically
-temp += delta * (1 - abs(current_temp - target_temp) / 500)
+# Thermal lag: asymptotic approach to target
+temp += delta * (1 - abs(current_temp - target_temp) / 600)
+
+# Anomaly scenarios override normal physics:
+# runaway: stepper_effect ignored, heat_rate *= 3
+# stuck-valve: stepper_effect = 0 always
+# mqtt-drop: client.disconnect() at t=5min, reconnect at t=10min
+# slow-heat: heat_rate *= 0.5, cool_rate *= 2 (wind simulation)
 ```
 
 **`docker-compose.yml` simulator service:**
@@ -220,27 +235,45 @@ roast_profiles (
 
 roast_sessions (
   id INTEGER PRIMARY KEY, profile_id INTEGER REFERENCES roast_profiles(id),
+  lot_id TEXT NOT NULL,       -- auto-assigned sequential (e.g. "LOT-0042"), user may override with custom label
   started_at TEXT NOT NULL, ended_at TEXT,
-  batch_weight_lbs REAL, peak_temp REAL,
-  color_rating TEXT, color_notes TEXT, operator_notes TEXT,
-  klaviyo_profile_id TEXT, status TEXT  -- "active"|"completed"|"aborted"
+  batch_volume_gal REAL,      -- standard batch = 5 gallons; recorded for reference
+  ambient_temp_f REAL,        -- fetched from Open-Meteo at session start
+  wind_speed_mph REAL,        -- fetched from Open-Meteo at session start
+  weather_fetched_at TEXT,    -- ISO timestamp of weather fetch
+  peak_temp REAL,
+  color_rating TEXT, color_notes TEXT,
+  batch_photo_path TEXT,      -- optional JPEG upload for this batch's color
+  operator_notes TEXT,
+  klaviyo_profile_id TEXT,
+  status TEXT                 -- "active"|"completed"|"aborted"|"emergency"
 )
 
 roast_telemetry (
   id INTEGER PRIMARY KEY, session_id INTEGER REFERENCES roast_sessions(id),
   recorded_at TEXT NOT NULL, temperature REAL NOT NULL,
   set_temp REAL, net_steps INTEGER, pid_output REAL,
-  ror_per_min REAL,          -- calculated server-side (60s rolling window)
+  ror_per_min REAL,           -- calculated server-side (60s rolling window)
   is_auto_mode INTEGER
 )
 
 roast_events (
   id INTEGER PRIMARY KEY, session_id INTEGER REFERENCES roast_sessions(id),
   occurred_at TEXT NOT NULL, temperature REAL,
-  event_type TEXT,           -- "cut_flame"|"eject"|"lid_on"|"cool_start"|"alert_sent"|"custom"
+  event_type TEXT,            -- "cut_flame"|"eject"|"lid_on"|"cool_start"|"alert_sent"|"emergency_close"|"cooldown_ready"|"custom"
   message TEXT, sent_to_klaviyo INTEGER
 )
+
+color_reference_photos (
+  id INTEGER PRIMARY KEY,
+  wood_type TEXT NOT NULL,    -- "toasted_oak"|"charred_oak"|"smoke_infusion"|"toasted_cherry"
+  color_label TEXT NOT NULL,  -- e.g. "Light", "Medium", "Dark", "Extra Dark"
+  photo_path TEXT NOT NULL,   -- path to JPEG in server's static/color-refs/ directory
+  notes TEXT, created_at TEXT
+)
 ```
+
+**Lot ID generation:** Sequential numeric ID auto-assigned on session start (e.g. `LOT-0042`). User may override with a custom text label at session start. Multiple batches in a day each get their own lot ID — date alone is not sufficient to distinguish them.
 
 Enable WAL mode on init: `PRAGMA journal_mode=WAL` to prevent read/write contention at 2s insert rate.
 
@@ -275,53 +308,73 @@ The stepper motor controls a propane valve through a tight coupler. Key physical
 3. Record that count, subtract 15% as safety margin → that's `MAX_CLOSE_STEPS`
 4. Store in firmware constants
 
+### LittleFS Persistent State
+
+LittleFS stores data in the ESP32's flash memory — the same physical chip that holds the firmware. It survives power loss, power blips, and reboots. Both `netSteps` and `setTemp` are written to LittleFS on every change and restored on boot.
+
+Default `setTemp` if no stored value exists: **450°F** (hardcoded constant matching typical roast target).
+
 ### Startup / Ignition Procedure
 
-The motor is **disabled on every boot**. This replaces the previous practice of physically unplugging the motor to free the valve for ignition.
+A new session requires a live server connection before PID starts. Once running, PID sustains independently if the connection drops mid-roast (fire safety). The motor is **disabled on every boot** — this replaces physically unplugging the motor.
 
 ```
 Boot → ENABLE_PIN HIGH (motor disabled, shaft free)
-     → OLED: "IGNITION MODE"
+     → Restore setTemp from LittleFS (default 450°F)
+     → OLED: "IGNITION MODE / FREE VALVE"
      → Dashboard: "Ignition Mode — valve free to turn"
 
 User manually opens valve → ignites burner → dials back to reference mark
 
-User presses "Lock & Begin Session" on dashboard
+User presses "Lock & Begin Session" on dashboard (requires server connection)
      → ENABLE_PIN LOW (motor locks at current position)
-     → netSteps = 0
+     → netSteps = 0 saved to LittleFS
      → PID starts
 ```
 
+**Future consideration:** A physical button on the device for "Lock & Begin Session" — eliminates the need to have the dashboard open for startup. Not in initial scope.
+
 ### Restart Mid-Roast
 
-If the device restarts during an active session:
-- Motor starts disabled (valve holds position — no drift)
-- `netSteps` is read from LittleFS (written on every step change)
-- OLED and dashboard show: "Restart detected — last position: +X steps"
-- User chooses:
-  - **Resume** → motor locks at stored position, PID continues
-  - **Re-home** → user manually returns valve to reference mark, motor locks at netSteps = 0
+LittleFS stores both `netSteps` and `setTemp`, so both survive power loss.
+
+- Motor starts disabled (valve holds position — no drift confirmed)
+- `netSteps` and `setTemp` restored from LittleFS
+- OLED: "RESTART / LOCK TO RESUME"
+- Dashboard: "Restart detected — last position: +X steps. Resume or Re-home?"
+- **Default action: Resume** — motor locks at stored position, PID continues at stored setTemp
+- Manual option: Re-home — user returns valve to reference mark, motor locks at netSteps = 0
 
 ### Normal Session End
 
 On "End Roast" from dashboard:
 1. PID suspended
 2. Drive to netSteps = 0 (minimum stable flame) at normal speed
-3. Disable motor (ENABLE_PIN HIGH) — valve free for manual close
-4. Dashboard prompts: "Motor released. Close valve manually."
+3. Disable motor (ENABLE_PIN HIGH) — valve free
+4. OLED: "BEGIN COOL DOWN"
+5. Dashboard enters cooldown tracking mode (user has already closed the tank valve)
+
+### Cooldown Tracking
+
+After session end, the device remains on and continues reading temperature. The server logs telemetry to the session record until temp falls below **200°F**.
+
+- Below 200°F: queue `Roast Notification` alert (alert_type: `cooldown_ready`, message: "Batch is below 200°F — safe to handle")
+- OLED: "SAFE TO EJECT" (or for Smoke Infusion: "SAFE TO EJECT" at this point per procedure)
+- Dashboard shows cooldown curve in real time
 
 ### Temperature Thresholds
 
 | Level | Threshold | Action |
 |---|---|---|
-| Warning | ~550°F | Queue `Roast Notification` alert (alert_type: `temp_alert`), PID continues |
-| Hard cutoff | ~675°F | Emergency close sequence (see below) |
+| Normal telemetry | Active session, any temp | `progress_update` alert every **10 minutes** |
+| Concern zone | >500°F | `temp_alert` every **30 seconds**, PID continues |
+| Emergency close | 600°F | Emergency close sequence (see below) |
 
-Thresholds are defined as firmware constants and can be adjusted without changing logic.
+All thresholds are firmware constants, adjustable without logic changes.
 
 ### Emergency Close Sequence
 
-Triggered automatically at hard cutoff temperature. No network required.
+Triggered automatically at 600°F. No network required.
 
 ```
 1. Drive CCW at maximum safe speed until netSteps = -MAX_CLOSE_STEPS
@@ -329,23 +382,25 @@ Triggered automatically at hard cutoff temperature. No network required.
 2. ENABLE_PIN HIGH — motor releases, valve free for manual intervention
 3. PID suspended, session flagged EMERGENCY
 4. Queue alert to LittleFS: alert_type "emergency_close", timestamp, last temp
-5. OLED: "EMERGENCY — CLOSE TANK VALVE"
+5. OLED: "EMERGENCY / CLOSE TANK VALVE"
 6. Dashboard: red emergency state on reconnect
 7. Recovery requires explicit manual reset — system does NOT auto-resume
 ```
+
+**If temperature is NOT dropping during emergency close:** This indicates a stepper, coupler, or valve failure. The firmware detects this by comparing temp readings every 10 seconds during the close sequence. If temp has not dropped by at least 5°F after 30 seconds of driving CCW, it queues a secondary alert (alert_type: `emergency_valve_failure`) and begins sending `temp_alert` notifications every 30 seconds until manually reset. This is an aggressive alert state — the assumption is something is mechanically wrong and immediate human intervention is required.
 
 The $12 stepper motor is considered acceptable collateral damage in an emergency. Burning down the building is not.
 
 ### Rate-of-Rise Alarm
 
-In addition to absolute temperature thresholds, a simplified ROR check runs on the device (independent of the server's 60-second rolling ROR):
+A simplified ROR check runs on the device (independent of the server's 60-second rolling ROR):
 - Compares current temp to the reading from 30 seconds ago
-- If delta > 50°F in 30 seconds while already above 500°F → queues warning alert
-- Does not trigger emergency close on its own — that's the threshold's job
+- If delta > 50°F in 30 seconds while already above 500°F → queues `temp_alert`
+- Does not trigger emergency close on its own — that's the 600°F threshold's job
 
 ### Alert Queue (Network-Resilient)
 
-All alerts are written to a LittleFS circular buffer (max 20 events) before attempting MQTT publish. On MQTT reconnect, the queue is replayed in order. The server deduplicates by `timestamp + alert_type`. A 10-minute internet outage followed by a reconnect at 620°F sends the alert immediately on reconnect.
+All alerts are written to a LittleFS circular buffer (max 20 events) before attempting MQTT publish. On MQTT reconnect, the queue is replayed in order. The server deduplicates by `timestamp + alert_type`. A 10-minute internet outage followed by a reconnect at 550°F sends the alert immediately on reconnect.
 
 ---
 
@@ -362,9 +417,29 @@ All alerts are written to a LittleFS circular buffer (max 20 events) before atte
 - `publishTelemetry()` — builds JSON with `JsonDocument`, publishes every 2s
 - `mqttCallback()` — dispatches on `cmd` field, applies `setTemp` as absolute assignment
 - `safetyLoop()` — runs every 2s alongside PID; checks temperature thresholds, enforces step limits, triggers emergency close, manages alert queue
-- `emergencyClose()` — drives to -MAX_CLOSE_STEPS at max speed, disables motor, writes LittleFS alert
-- `loadStepState()` / `saveStepState()` — reads/writes netSteps to LittleFS on every change
-- OLED shows MQTT connection status ("MQTT: OK" / "MQTT: --"), ignition mode state, and emergency state
+- `emergencyClose()` — drives to -MAX_CLOSE_STEPS at max speed, disables motor, writes LittleFS alert; monitors temp drop and escalates to `emergency_valve_failure` alerts if temp not falling
+- `loadState()` / `saveState()` — reads/writes `netSteps` AND `setTemp` to LittleFS on every change; both survive power loss
+
+**MQTT command additions:**
+```json
+{ "cmd": "setMotorEnable", "enabled": false }   — disable motor (free valve for manual)
+{ "cmd": "setMotorEnable", "enabled": true }    — enable motor (lock valve)
+```
+The Manual/Auto dashboard toggle sends `setMotorEnable` before or after `setMode`.
+
+**OLED display — size constraints:**
+The OLED is very small (128×64 pixels). Current layout: temperature in large font, a few secondary values in minimum readable font. Nothing can be made smaller than it already is. The OLED must communicate state in 1–3 short lines maximum. All procedural guidance uses brief uppercase labels.
+
+OLED state machine:
+| State | Line 1 | Line 2 | Line 3 |
+|---|---|---|---|
+| Ignition mode | `IGNITION MODE` | `FREE VALVE` | — |
+| Running, MQTT OK | `427°F → 450°F` | `AUTO  OK` | `+18 steps` |
+| Running, MQTT down | `427°F → 450°F` | `AUTO  --` | `+18 steps` |
+| Restart detected | `RESTART DET.` | `LOCK TO RESUME` | — |
+| Cool down | `BEGIN COOL DOWN` | `312°F` | — |
+| Safe to eject | `SAFE TO EJECT` | `188°F` | — |
+| Emergency | `!! EMERGENCY !!` | `CLOSE TANK` | `600°F` |
 
 **`platformio.ini` lib_deps to add:**
 ```
@@ -380,9 +455,21 @@ Also add: `build_flags = -DMQTT_MAX_PACKET_SIZE=512`
 
 ## Docker Services
 
+### Production Server
+
+| Property | Value |
+|---|---|
+| Host | PRODUCTION_HOST |
+| SSH user | PRODUCTION_USER |
+| Auth | Certificate (no password) |
+| App port | **8060** |
+| MQTT port | 1883 (internal to Docker network) |
+
+Dashboard accessible at `http://PRODUCTION_HOST:8060` from any LAN device.
+
 ### `docker-compose.yml`
 - `mosquitto`: ports 1883 (MQTT) + 9001 (WebSocket, for future debug). `allow_anonymous true` for LAN-only.
-- `app`: FastAPI + uvicorn, port 8000. Volumes: `./app:/app` (live reload during dev) + named `roaster-db:/data` for SQLite persistence. Env vars: `MQTT_BROKER`, `DB_PATH`, `KLAVIYO_API_KEY`, `KLAVIYO_PROFILE_EMAIL`.
+- `app`: FastAPI + uvicorn, **port 8060**. Volumes: `./app:/app` (live reload during dev) + named `roaster-db:/data` for SQLite persistence. Env vars: `MQTT_BROKER`, `DB_PATH`, `KLAVIYO_API_KEY`, `KLAVIYO_PROFILE_EMAIL`, `WEATHER_ZIP`, `OPEN_METEO_LAT`, `OPEN_METEO_LON`.
 
 ### Key Python Library Choices
 - `paho-mqtt==2.0.0` — new callback API (5-arg `on_connect`), use `CallbackAPIVersion.VERSION2`
@@ -404,16 +491,55 @@ Capture `_loop` inside the `lifespan` coroutine via `asyncio.get_event_loop()`. 
 ### WebSocket Push
 Maintain a `set[WebSocket]` of active connections. The `on_telemetry` callback: writes to DB → calculates ROR → broadcasts `{"type":"telemetry","data":{...}}` to all clients. Dead connections are pruned on send failure.
 
+### API-First Design
+
+All dashboard functionality is backed by the REST API. The UI is a thin client that calls the same endpoints any future agent or external tool would use. No business logic lives in HTML/JS — only presentation.
+
+### Weather Integration (`weather.py`)
+
+Fetches current conditions from **Open-Meteo** (free, no API key) at session start. Zip code 75248 is the default; configurable via `WEATHER_ZIP` env var. Lat/lon resolved once from zip and cached.
+
+```python
+# Open-Meteo endpoint (no auth required):
+GET https://api.open-meteo.com/v1/forecast
+    ?latitude={lat}&longitude={lon}
+    &current=temperature_2m,wind_speed_10m
+    &temperature_unit=fahrenheit
+    &wind_speed_unit=mph
+```
+
+Weather is fetched once at "Lock & Begin Session" and stored in the session record. Not polled during the roast.
+
 ### REST Endpoints
 ```
-POST /api/sessions/start          — select profile, enter batch weight/notes
-POST /api/sessions/{id}/end       — enter color rating + notes
-GET  /api/sessions                — list (50 most recent)
-GET  /api/sessions/{id}/telemetry — time-series for historical chart
-GET/POST/DELETE /api/profiles     — profile CRUD
-POST /api/commands                — validates CommandPayload → MQTT publish
-GET  /api/status                  — latest telemetry snapshot
-POST /api/events                  — manually log a roast event
+# Sessions
+POST /api/sessions/start              — profile, lot_id (optional override), notes; fetches weather
+POST /api/sessions/{id}/end           — color_rating, color_notes, operator_notes
+GET  /api/sessions                    — list (50 most recent, includes lot_id + weather)
+GET  /api/sessions/{id}               — full session detail
+GET  /api/sessions/{id}/telemetry     — time-series for historical chart
+POST /api/sessions/{id}/photo         — upload batch color JPEG (multipart)
+
+# Profiles
+GET/POST         /api/profiles        — list / create
+GET/PUT/DELETE   /api/profiles/{id}   — detail / update / delete
+
+# Commands (validated → MQTT publish)
+POST /api/commands                    — CommandPayload → roaster/commands topic
+
+# Status
+GET  /api/status                      — latest telemetry snapshot + session state
+
+# Events
+POST /api/events                      — manually log a roast event
+
+# Color reference library
+GET  /api/color-refs                  — list all reference photos by wood type
+POST /api/color-refs                  — upload a reference JPEG with label + wood type
+DELETE /api/color-refs/{id}           — remove a reference photo
+
+# Weather (on-demand fetch, not stored)
+GET  /api/weather                     — current conditions for configured zip
 ```
 
 ### ROR Calculation (in `database.py`)
@@ -431,15 +557,18 @@ Headers: `Authorization: Klaviyo-API-Key {pk_...}`, `revision: 2024-02-15`
 **Event name:** `Roast Notification`
 
 **`alert_type` values and when they fire:**
-| `alert_type` | When |
-|---|---|
-| `temp_alert` | Temp deviates > threshold from setpoint for > 30s |
-| `progress_update` | Every 5 minutes during active session (replaces IFTTT) |
-| `profile_step` | Profile-scheduled offset reached (cut flame, eject, lid on, etc.) |
+| `alert_type` | When | Frequency |
+|---|---|---|
+| `progress_update` | Active session, temp ≤ 500°F (normal operation) | Every **10 minutes** |
+| `temp_alert` | Temp > 500°F (concern zone) | Every **30 seconds** |
+| `emergency_close` | Emergency close sequence triggered (≥ 600°F) | Once on trigger |
+| `emergency_valve_failure` | Temp not dropping during emergency close | Every **30 seconds** until manual reset |
+| `profile_step` | Profile-scheduled offset reached (cut flame, eject, lid on, etc.) | On schedule |
+| `cooldown_ready` | Temp drops below 200°F post-session | Once |
 
 **Properties always included:** `session_id`, `wood_type`, `current_temp`, `elapsed_min`, `alert_type`, `message`, `subject`.
 
-`subject` is included in the event payload so Klaviyo's conditional blocks can set the email subject line without needing separate flows.
+`subject` is included in the event payload so Klaviyo's conditional blocks can set the email subject line without needing separate flows. Email body content (including future HTML formatting) is controlled by Klaviyo template conditional blocks keyed on `alert_type`.
 
 ---
 
@@ -462,31 +591,42 @@ Background `asyncio` task, checks every 15 seconds. For the active session, comp
 
 ## Frontend Features (`static/index.html` + `static/app.js`)
 
+**Design:** Mobile-first. All controls and live data are designed for phone/tablet use. Historical analysis views (charts, overlays, color consistency table) may use wider layouts on desktop — this is the one area where desktop-first is acceptable.
+
 **Live Dashboard:**
 - Large current temp display + ROR (°F/min)
 - Set temp with +5/-5 buttons
-- Manual/Auto toggle, Real/Sim toggle
-- CW/CCW stepper buttons with step size slider
+- Manual/Auto toggle — switching to Manual **disables the motor** (ENABLE_PIN HIGH), freeing the valve for hand adjustment. Switching back to Auto re-enables the motor.
+- Real/Sim toggle
+- CW/CCW stepper buttons with step size slider (Manual mode only)
 - Elapsed time + net steps
 - Dual-axis Chart.js: temp (left) + ROR (right, dashed), `animation: false` for live updates
 - WebSocket with 3s auto-reconnect
+- Cooldown tracking view after session end (temp curve continues until <200°F)
 
 **Session Management:**
-- "Start Roast" button → modal: select profile, enter batch weight (lbs) + notes
-- "End Roast" button → modal: enter color rating + color notes
-- Active session shown in header with elapsed time
+- "Lock & Begin Session" button (requires server connection) → modal:
+  - Select profile
+  - Lot ID (auto-assigned, optional override with custom label)
+  - Batch volume (default: 5 gal — standard batch size; editable)
+  - Ambient conditions auto-fetched from Open-Meteo (shown, not editable)
+  - Operator notes
+- "End Roast" button → modal: color rating (with color reference swatches), color notes, batch photo upload (JPEG), operator notes
+- Active session shown in header with elapsed time and lot ID
 
-**History Tab:**
-- Table of past sessions: date, profile, peak temp, color rating, status
+**History Tab** (desktop-friendly layout acceptable):
+- Table of past sessions: lot ID, date, profile, peak temp, color rating, weather (temp + wind), status
 - Click row → loads historical chart (x-axis = elapsed minutes, not wall clock)
 - Overlay toggle: select a past roast to overlay on any chart for visual comparison
 
-**Color Consistency Table:**
+**Color Consistency Table** (desktop-friendly layout acceptable):
 - Filters by wood type / profile
-- Shows: date, peak temp, color rating, notes — the QA tool for dialing in batch consistency
+- Shows: lot ID, date, peak temp, color rating, batch photo thumbnail, weather, notes
+- Color reference photo library: upload JPEG swatches per wood type with color label (Light/Medium/Dark/Extra Dark) for side-by-side comparison
 
 **PID Tuning Panel** (`<details>` collapsed by default):
 - Editable Kp, Ki, Kd inputs → sends `setPid` command to ESP32
+- Each value has a plain-language tooltip/description explaining what it controls in non-technical terms (e.g. Kp: "How aggressively the system responds to being off-target. Higher = faster response but more overshoot.")
 
 ---
 
@@ -521,10 +661,15 @@ Background `asyncio` task, checks every 15 seconds. For the active session, comp
 
 ## Verification Plan
 
-1. Flash firmware → OLED shows "MQTT: OK" → `mosquitto_sub` shows telemetry JSON every 2s
-2. `docker compose up` → `http://[vm-ip]:8000` loads dashboard → live temp chart updates
-3. Press CW/CCW on dashboard → ESP32 blue LED blinks → stepper moves
-4. Start a session with "Toasted Oak" profile → set `simMode: true` → advance time 35 min in DB → confirm Klaviyo event fires
-5. End session → fill in color rating → verify in history tab and color consistency table
-6. Check SQLite: `sqlite3 /data/roaster.db "SELECT * FROM roast_telemetry LIMIT 5"`
-7. Load historical session → overlay a second session → confirm dual curves on chart
+1. Flash firmware → OLED shows `IGNITION MODE / FREE VALVE` → motor shaft spins freely by hand
+2. Send "Lock & Begin Session" command via dashboard → OLED switches to temp display → stepper locks
+3. `mosquitto_sub -t roaster/telemetry` on broker → confirms JSON telemetry every 2s
+4. `docker compose up` → `http://PRODUCTION_HOST:8060` loads dashboard → live temp chart updates
+5. Press CW/CCW on dashboard (manual mode) → ESP32 blue LED blinks → stepper moves
+6. Start a session with "Toasted Oak" profile → confirm weather auto-fetched → lot ID auto-assigned
+7. Run simulator anomaly: `python simulator.py --scenario runaway` → confirm 500°F alerts fire every 30s, 600°F triggers emergency close
+8. Emergency close: confirm OLED shows `!! EMERGENCY !!`, motor disables, alert queued to LittleFS
+9. Kill MQTT mid-session → confirm PID keeps running → reconnect → confirm queued alerts replay
+10. End session → upload batch photo → verify in history tab with lot ID and weather data
+11. Check SQLite: `sqlite3 /data/roaster.db "SELECT lot_id, ambient_temp_f, wind_speed_mph FROM roast_sessions"`
+12. Load historical session → overlay a second session → confirm dual curves on chart
